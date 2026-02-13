@@ -1,0 +1,26 @@
+# dependencies
+**/node_modules/
+
+# env files (secrets)
+**/.env
+**/.env.*
+!**/.env.example
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# build outputs
+**/build/
+
+# archives / downloads
+*.zip
+*.rar
+
+# Supabase local (if ever used)
+**/.supabase/
