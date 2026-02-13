@@ -10,6 +10,7 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+push.log*
 
 # OS
 .DS_Store
