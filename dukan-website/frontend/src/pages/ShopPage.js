@@ -1,22 +1,42 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { useRegion } from "../regionContext";
 import { formatMoney, getProductUnitPrice } from "../pricing";
 import { getCategoryLabel, normalizeCategory } from "../categories";
 import { apiFetch } from "../api";
 import HeroSlider from "../components/HeroSlider";
+import ReviewsSlider from "../components/ReviewsSlider";
 
 export default function ShopPage() {
   const [products, setProducts] = useState([]);
   const [error, setError] = useState("");
   const { region } = useRegion();
   const location = useLocation();
+  const arrivalsRef = useRef(null);
 
   const sliderImages = useMemo(
     () => [
-      { src: "/slider/slide-1.jpg", alt: "Featured collection" },
-      { src: "/slider/slide-2.jpg", alt: "New arrivals" },
-      { src: "/slider/slide-3.jpg", alt: "Seasonal picks" },
+      {
+        src: "/slider/slide-1.jpg",
+        alt: "Featured collection",
+        kicker: "HANDCRAFT WITH LOVE",
+        headline: "FLAT 949",
+      },
+      {
+        src: "/slider/slide-2.jpg",
+        alt: "New arrivals",
+        kicker: "ONLINE EXCLUSIVE SALE",
+        headline: "UPTO 60 % OFF",
+      },
+      {
+        src: "/slider/slide-3.jpg",
+        alt: "Seasonal picks",
+        kicker: "KIDS WINTER COLLECTION IS LIVE",
+        headline: "CHECK OUT NOW",
+        // Slide 3 has a longer top line; keep it a bit lower to avoid overlapping the header.
+        textTop: "10vh",
+        textTopMobile: "92px",
+      },
     ],
     []
   );
@@ -54,6 +74,28 @@ export default function ShopPage() {
       });
   }, [activeCategory]);
 
+  // Ensure category tiles always scroll to product list (even if hash scrolling is missed).
+  useEffect(() => {
+    if (location.hash !== "#arrivals") return;
+
+    const behavior = window?.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches
+      ? "auto"
+      : "smooth";
+
+    const scroll = () => {
+      try {
+        arrivalsRef.current?.scrollIntoView?.({ behavior, block: "start" });
+      } catch {
+        // ignore
+      }
+    };
+
+    // One immediate attempt + one delayed attempt (after render/data).
+    scroll();
+    const t = setTimeout(scroll, 50);
+    return () => clearTimeout(t);
+  }, [location.hash, activeCategory, products.length]);
+
   useEffect(() => {
     if (typeof window === "undefined" || typeof window.IntersectionObserver !== "function") {
       return;
@@ -79,13 +121,13 @@ export default function ShopPage() {
 
   return (
     <div>
-      <section className="hero hero-fullbleed">
+      <section className="hero hero-fullbleed hero-home">
         <HeroSlider images={sliderImages} />
       </section>
 
-      <section className="first-on" aria-label="First on KB">
+      <section className="first-on" aria-label="First on ZUBILO">
         <div className="container">
-          <div className="first-on-inner">FIRST ON KB.in</div>
+          <div className="first-on-inner">FIRST ON ZUBILO</div>
         </div>
       </section>
 
@@ -107,7 +149,13 @@ export default function ShopPage() {
         </div>
       </section>
 
-      <section className="section">
+      <ReviewsSlider
+        title="Reviews"
+        subtitle="Faux Fur Jacket feedback from USA customers"
+        mix
+      />
+
+      <section className="section" id="arrivals" ref={arrivalsRef}>
         <div className="container">
           <div className="section-head">
             <h2 className="section-title">{getCategoryLabel(activeCategory)}</h2>

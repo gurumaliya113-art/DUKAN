@@ -11,6 +11,9 @@ export default function Navbar() {
   const { region, setRegion } = useRegion();
   const location = useLocation();
 
+  const isHome = location.pathname === "/";
+  const homeTop = isHome && !scrolled;
+
   const activeCategory = useMemo(() => {
     const params = new URLSearchParams(location.search || "");
     return normalizeCategory(params.get("category"));
@@ -28,13 +31,31 @@ export default function Navbar() {
   }, [location.pathname, location.search]);
 
   return (
-    <header className={scrolled ? "nav scrolled" : "nav"}>
+    <header className={["nav", scrolled ? "scrolled" : "", homeTop ? "home-top" : ""]
+      .filter(Boolean)
+      .join(" ")}
+    >
       <div className="promo-bar" role="region" aria-label="Announcement">
         <div className="container promo-inner">
-          <span>The Spring Summer'26 Drop is Here!</span>
-          <a className="promo-link" href="#arrivals">
-            Shop Now
-          </a>
+          <div
+            className="promo-marquee"
+            aria-label="Free Shipping All Over World. 7 day Return Window All Over World."
+          >
+            <div className="promo-track" aria-hidden="true">
+              <div className="promo-content">
+                <span className="promo-item">Free Shipping All Over World</span>
+                <span className="promo-sep">•</span>
+                <span className="promo-item">7 day Return Window All Over World</span>
+                <span className="promo-sep">•</span>
+              </div>
+              <div className="promo-content">
+                <span className="promo-item">Free Shipping All Over World</span>
+                <span className="promo-sep">•</span>
+                <span className="promo-item">7 day Return Window All Over World</span>
+                <span className="promo-sep">•</span>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -69,32 +90,20 @@ export default function Navbar() {
               />
             </svg>
           </button>
-
-          <button className="icon-btn" type="button" aria-label="Search">
-            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-              <path
-                d="M10.5 18a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15Zm7.9 1.1-4.1-4.1"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.6"
-                strokeLinecap="round"
-              />
-            </svg>
-          </button>
         </div>
 
-        <Link to="/" className="brand" aria-label="KB Home">
-          KB
+        <Link to="/" className="brand" aria-label="ZUBILO Home">
+          ZUBILO
         </Link>
 
         <div className="nav-right" aria-label="Actions">
           <NavLink
-            to="/admin"
+            to="/login"
             className={({ isActive }) =>
               isActive ? "nav-link active admin-link" : "nav-link admin-link"
             }
           >
-            ADMIN
+            LOGIN
           </NavLink>
 
           <label className="sr-only" htmlFor="region-select-top">
@@ -110,18 +119,6 @@ export default function Navbar() {
             <option value="IN">India (INR)</option>
             <option value="US">USA (USD)</option>
           </select>
-
-          <button className="icon-btn" type="button" aria-label="Wishlist">
-            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-              <path
-                d="M12 20.5s-7.5-4.6-9.4-8.8C1 8.1 3.3 5.5 6.4 5.5c1.7 0 3.2.8 4.1 2 0 0 0 0 0 0 .6-.9 1.4-1.5 2.4-1.8.5-.1 1.1-.2 1.7-.2 3.1 0 5.4 2.6 3.8 6.2C19.5 15.9 12 20.5 12 20.5Z"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.6"
-                strokeLinejoin="round"
-              />
-            </svg>
-          </button>
 
           <Link className="icon-btn" to="/cart" aria-label="Cart">
             <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
@@ -153,12 +150,12 @@ export default function Navbar() {
         <div className="container mobile-menu-inner" aria-label="Menu">
           <div className="mobile-menu-actions">
             <NavLink
-              to="/admin"
+              to="/login"
               className={({ isActive }) =>
                 isActive ? "nav-link active" : "nav-link"
               }
             >
-              ADMIN
+              LOGIN
             </NavLink>
 
             <label className="sr-only" htmlFor="region-select-menu">

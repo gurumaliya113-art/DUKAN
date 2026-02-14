@@ -2,10 +2,49 @@ import React, { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useCart } from "../cartContext";
 import { useRegion } from "../regionContext";
-import { formatMoney, getProductUnitPrice } from "../pricing";
+import { formatMoney, getProductUnitMrp, getProductUnitPrice } from "../pricing";
 import { apiFetch } from "../api";
+import ReviewsSlider from "../components/ReviewsSlider";
 
-const SIZES = ["XS", "S", "M", "L", "XL"]; 
+const DEFAULT_SIZES = ["XS", "S", "M", "L", "XL"];
+
+function normalizeProductSizes(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.filter(Boolean).map((s) => String(s));
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+
+    // JSON string like: ["S","M"]
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed.filter(Boolean).map((s) => String(s));
+      } catch {
+        // ignore
+      }
+    }
+
+    // Postgres array text like: {"0-1 year","S"}
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      const inner = trimmed.slice(1, -1).trim();
+      if (!inner) return [];
+      return inner
+        .split(",")
+        .map((s) => s.trim().replace(/^"|"$/g, ""))
+        .filter(Boolean);
+    }
+
+    // Fallback comma-separated
+    return trimmed
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  return [];
+}
 
 export default function ProductPage() {
   const { id } = useParams();
@@ -101,6 +140,24 @@ export default function ProductPage() {
   const images = [product.image1, product.image2, product.image3, product.image4].filter(Boolean);
   const mainImage = activeImage || images[0] || "https://via.placeholder.com/900";
   const unit = getProductUnitPrice(product, region);
+  const unitMrp = getProductUnitMrp(product, region);
+
+  const productSizes = normalizeProductSizes(product?.sizes);
+  const sizes = productSizes.length ? productSizes : DEFAULT_SIZES;
+  const showMrp =
+    Number(unitMrp?.amount || 0) > 0 &&
+    unitMrp?.currency === unit?.currency &&
+    Number(unitMrp.amount) > Number(unit.amount || 0);
+
+  let offPercent = 0;
+  if (showMrp) {
+    const mrp = Number(unitMrp.amount || 0);
+    const price = Number(unit.amount || 0);
+    if (mrp > 0 && price >= 0 && mrp > price) {
+      const pct = Math.round(((mrp - price) / mrp) * 100);
+      offPercent = Number.isFinite(pct) && pct > 0 ? Math.min(99, pct) : 0;
+    }
+  }
 
   return (
     <div className="detail">
@@ -130,14 +187,22 @@ export default function ProductPage() {
 
           <div>
             <h1 className="detail-title">{product.name}</h1>
-            <div className="detail-price">{formatMoney(unit.amount, unit.currency)}</div>
+            <div className="detail-price-row">
+              <span className="detail-price">{formatMoney(unit.amount, unit.currency)}</span>
+              {showMrp ? (
+                <>
+                  <span className="detail-mrp">{formatMoney(unitMrp.amount, unitMrp.currency)}</span>
+                  {offPercent ? <span className="detail-off">{offPercent}% OFF</span> : null}
+                </>
+              ) : null}
+            </div>
             {product.description ? (
               <p className="detail-desc">{product.description}</p>
             ) : null}
 
             <div className="label">Size</div>
             <div className="sizes">
-              {SIZES.map((s) => (
+              {sizes.map((s) => (
                 <button
                   key={s}
                   type="button"
@@ -167,6 +232,13 @@ export default function ProductPage() {
               <Link to="/">← Back to Latest Arrivals</Link>
             </p>
           </div>
+        </div>
+
+        <div style={{ marginTop: 26 }}>
+          <ReviewsSlider
+            title="Reviews"
+            subtitle="Faux Fur Jacket reviews (USA)"
+          />
         </div>
       </div>
     </div>

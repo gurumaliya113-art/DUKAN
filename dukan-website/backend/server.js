@@ -71,6 +71,23 @@ const requireAdmin = async (req, res, next) => {
     }
 };
 
+const requireCustomer = async (req, res, next) => {
+    try {
+        const token = getBearerToken(req);
+        if (!token) return res.status(401).json({ error: "Missing Authorization bearer token" });
+
+        const { data: userData, error: userError } = await supabasePublic.auth.getUser(token);
+        if (userError || !userData?.user) {
+            return res.status(401).json({ error: "Invalid or expired token" });
+        }
+
+        req.customer = userData.user;
+        return next();
+    } catch (e) {
+        return res.status(500).json({ error: e?.message || "Customer auth failed" });
+    }
+};
+
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 5 * 1024 * 1024 },
@@ -81,6 +98,76 @@ const parseNumberOrNull = (value) => {
     const n = typeof value === "string" ? Number(value) : Number(value);
     if (Number.isNaN(n)) return null;
     return n;
+};
+
+const parseDateTimeOrNull = (value) => {
+    if (value === undefined || value === null || value === "") return null;
+    try {
+        const d = new Date(value);
+        if (Number.isNaN(d.getTime())) return null;
+        return d.toISOString();
+    } catch {
+        return null;
+    }
+};
+
+const PRODUCT_SIZE_OPTIONS = [
+    "0-1 year",
+    "1-2 year",
+    "2-4 year",
+    "S",
+    "M",
+    "L",
+    "XL",
+    "XXL",
+    "XXXL",
+];
+
+const parseProductSizesOrNull = (value) => {
+    if (value === undefined || value === null || value === "") return null;
+
+    let rawList = [];
+    if (Array.isArray(value)) {
+        rawList = value;
+    } else {
+        const s = String(value);
+        const trimmed = s.trim();
+        if (!trimmed) return null;
+
+        // FormData typically sends JSON string like: ["S","M"]
+        if ((trimmed.startsWith("[") && trimmed.endsWith("]")) || (trimmed.startsWith("\"") && trimmed.endsWith("\""))) {
+            try {
+                const parsed = JSON.parse(trimmed);
+                if (Array.isArray(parsed)) rawList = parsed;
+                else if (typeof parsed === "string") rawList = parsed.split(",");
+            } catch {
+                rawList = trimmed.split(",");
+            }
+        } else {
+            rawList = trimmed.split(",");
+        }
+    }
+
+    const allowed = new Map(PRODUCT_SIZE_OPTIONS.map((x) => [String(x).toLowerCase(), x]));
+    const picked = [];
+    const seen = new Set();
+
+    for (const item of rawList) {
+        const normalized = String(item || "").trim();
+        if (!normalized) continue;
+        const canon = allowed.get(normalized.toLowerCase());
+        if (!canon) continue;
+        if (seen.has(canon)) continue;
+        seen.add(canon);
+        picked.push(canon);
+    }
+
+    if (!picked.length) return null;
+
+    // Keep a stable order.
+    const weight = new Map(PRODUCT_SIZE_OPTIONS.map((x, i) => [x, i]));
+    picked.sort((a, b) => (weight.get(a) ?? 999) - (weight.get(b) ?? 999));
+    return picked;
 };
 
 const isMissingColumnError = (err) => {
@@ -106,10 +193,13 @@ const normalizeCategory = (value) => {
 
 const insertWithFallback = async (table, row, fallbackRow) => {
     let result = await supabaseAdmin.from(table).insert([row]).select("*").single();
-    if (result.error && isMissingColumnError(result.error) && fallbackRow) {
-        result = await supabaseAdmin.from(table).insert([fallbackRow]).select("*").single();
-    }
-    return result;
+        result.usedFallback = false;
+        if (result.error && isMissingColumnError(result.error) && fallbackRow) {
+            const fallback = await supabaseAdmin.from(table).insert([fallbackRow]).select("*").single();
+            fallback.usedFallback = true;
+            return fallback;
+        }
+        return result;
 };
 
 const updateWithFallback = async (table, update, whereEq, fallbackUpdate) => {
@@ -119,15 +209,53 @@ const updateWithFallback = async (table, update, whereEq, fallbackUpdate) => {
     });
     let result = await q.select("*").maybeSingle();
 
+    result.usedFallback = false;
     if (result.error && isMissingColumnError(result.error) && fallbackUpdate) {
         let q2 = supabaseAdmin.from(table).update(fallbackUpdate);
         Object.entries(whereEq || {}).forEach(([k, v]) => {
             q2 = q2.eq(k, v);
         });
         result = await q2.select("*").maybeSingle();
+
+        result.usedFallback = true;
     }
 
     return result;
+};
+
+const attachTrackingUpdates = async (orders) => {
+    if (!supabaseAdmin) return orders;
+    if (!Array.isArray(orders) || orders.length === 0) return orders;
+
+    const ids = orders.map((o) => o?.id).filter(Boolean);
+    if (ids.length === 0) return orders;
+
+    try {
+        const { data: updates, error } = await supabaseAdmin
+            .from("order_tracking_updates")
+            .select("id,order_id,location,note,created_at")
+            .in("order_id", ids)
+            .order("created_at", { ascending: false });
+
+        if (error) {
+            // If table/columns not present yet, do not fail main response.
+            return orders;
+        }
+
+        const grouped = new Map();
+        (updates || []).forEach((u) => {
+            const key = u.order_id;
+            if (!grouped.has(key)) grouped.set(key, []);
+            grouped.get(key).push(u);
+        });
+
+        return orders.map((o) => ({
+            ...o,
+            tracking_received: grouped.get(o.id) || [],
+        }));
+    } catch {
+        return orders;
+    }
 };
 
 const maybeUploadImages = (req, res, next) => {
@@ -243,18 +371,44 @@ app.post("/admin/create", async (req, res) => {
         return res.status(400).json({ error: "Password must be at least 6 characters" });
     }
 
+    const normalizedEmail = String(email).trim().toLowerCase();
+
     const { data: created, error: createError } = await supabaseAdmin.auth.admin.createUser({
-        email: String(email).trim().toLowerCase(),
+        email: normalizedEmail,
         password: String(password),
         email_confirm: true,
     });
 
-    if (createError || !created?.user) {
-        return res.status(400).json({ error: createError?.message || "Failed to create admin user" });
-    }
+    // If user already exists, do not fail. Just grant admin to that existing user.
+    let userId = created?.user?.id || null;
+    let userEmail = created?.user?.email || normalizedEmail;
+    let existed = false;
 
-    const userId = created.user.id;
-    const userEmail = created.user.email || String(email).trim().toLowerCase();
+    if (createError || !created?.user) {
+        const msg = String(createError?.message || "");
+        const looksLikeExists = /already\s+been\s+registered|already\s+registered|user\s+already\s+registered|email\s+already\s+exists|duplicate/i.test(
+            msg.toLowerCase()
+        );
+
+        if (!looksLikeExists) {
+            return res.status(400).json({ error: createError?.message || "Failed to create admin user" });
+        }
+
+        const { data: existing, error: existingError } = await supabaseAdmin.auth.admin.getUserByEmail(
+            normalizedEmail
+        );
+
+        if (existingError || !existing?.user) {
+            return res.status(400).json({
+                error: existingError?.message || msg || "User exists but lookup failed",
+                hint: "Try logging in on Admin Panel (Login tab) or check Supabase Auth users.",
+            });
+        }
+
+        existed = true;
+        userId = existing.user.id;
+        userEmail = existing.user.email || normalizedEmail;
+    }
 
     const { error: insertError } = await supabaseAdmin
         .from("admin_users")
@@ -264,7 +418,7 @@ app.post("/admin/create", async (req, res) => {
         return res.status(400).json({ error: insertError.message || "Failed to mark user as admin" });
     }
 
-    return res.status(201).json({ ok: true, userId, email: userEmail });
+    return res.status(existed ? 200 : 201).json({ ok: true, userId, email: userEmail, existed });
 });
 
 // 👉 PRODUCTS ROUTE (YE ZAROORI HAI)
@@ -326,6 +480,9 @@ app.post("/products", requireAdmin, maybeUploadImages, async (req, res) => {
     const category = normalizeCategory(req.body?.category);
     const priceInrRaw = req.body?.price_inr ?? req.body?.priceInr ?? req.body?.price;
     const priceUsdRaw = req.body?.price_usd ?? req.body?.priceUsd;
+    const mrpInrRaw = req.body?.mrp_inr ?? req.body?.mrpInr ?? req.body?.mrp;
+    const mrpUsdRaw = req.body?.mrp_usd ?? req.body?.mrpUsd;
+    const sizesRaw = req.body?.sizes;
 
     try {
         const keys = Object.keys(req.body || {});
@@ -345,6 +502,8 @@ app.post("/products", requireAdmin, maybeUploadImages, async (req, res) => {
 
     const parsedPriceInr = parseNumberOrNull(priceInrRaw);
     const parsedPriceUsd = parseNumberOrNull(priceUsdRaw);
+    const parsedMrpInr = parseNumberOrNull(mrpInrRaw);
+    const parsedMrpUsd = parseNumberOrNull(mrpUsdRaw);
 
     if (!name || parsedPriceInr === null) {
         return res.status(400).json({
@@ -450,7 +609,10 @@ app.post("/products", requireAdmin, maybeUploadImages, async (req, res) => {
         price: parsedPriceInr,
         price_inr: parsedPriceInr,
         price_usd: parsedPriceUsd,
+        mrp_inr: parsedMrpInr,
+        mrp_usd: parsedMrpUsd,
         description: description || null,
+        sizes: parseProductSizesOrNull(sizesRaw),
         ...imageUrls,
     };
 
@@ -461,8 +623,18 @@ app.post("/products", requireAdmin, maybeUploadImages, async (req, res) => {
         ...imageUrls,
     };
 
-    const { data, error } = await insertWithFallback("products", row, fallbackRow);
+    const result = await insertWithFallback("products", row, fallbackRow);
+    const { data, error } = result;
     if (error) return res.status(400).json(error);
+
+    const requestedSizes = sizesRaw !== undefined && sizesRaw !== null && String(sizesRaw).trim() !== "";
+    if (requestedSizes && result.usedFallback) {
+        return res.status(201).json({
+            ...data,
+            warning: "Product saved, but sizes were NOT saved (DB missing products.sizes column). Run supabase-products-sizes.sql in Supabase SQL editor.",
+        });
+    }
+
     return res.status(201).json(data);
 });
 
@@ -513,7 +685,10 @@ app.put("/products/:id", requireAdmin, maybeUploadImages, async (req, res) => {
     const categoryRaw = req.body?.category;
     const priceInrRaw = req.body?.price_inr ?? req.body?.priceInr;
     const priceUsdRaw = req.body?.price_usd ?? req.body?.priceUsd;
+    const mrpInrRaw = req.body?.mrp_inr ?? req.body?.mrpInr;
+    const mrpUsdRaw = req.body?.mrp_usd ?? req.body?.mrpUsd;
     const legacyPriceRaw = req.body?.price;
+    const sizesRaw = req.body?.sizes;
 
     if (categoryRaw !== undefined) {
         update.category = normalizeCategory(categoryRaw);
@@ -526,6 +701,8 @@ app.put("/products/:id", requireAdmin, maybeUploadImages, async (req, res) => {
 
     const parsedPriceInr = priceInrRaw !== undefined ? parseNumberOrNull(priceInrRaw) : null;
     const parsedPriceUsd = priceUsdRaw !== undefined ? parseNumberOrNull(priceUsdRaw) : null;
+    const parsedMrpInr = mrpInrRaw !== undefined ? parseNumberOrNull(mrpInrRaw) : null;
+    const parsedMrpUsd = mrpUsdRaw !== undefined ? parseNumberOrNull(mrpUsdRaw) : null;
     const parsedLegacyPrice = legacyPriceRaw !== undefined ? parseNumberOrNull(legacyPriceRaw) : null;
 
     if (priceInrRaw !== undefined) {
@@ -543,9 +720,21 @@ app.put("/products/:id", requireAdmin, maybeUploadImages, async (req, res) => {
         update.price_usd = parsedPriceUsd;
     }
 
+    if (mrpInrRaw !== undefined) {
+        update.mrp_inr = parsedMrpInr;
+    }
+
+    if (mrpUsdRaw !== undefined) {
+        update.mrp_usd = parsedMrpUsd;
+    }
+
     if (description !== undefined) {
         const trimmed = String(description).trim();
         update.description = trimmed ? trimmed : null;
+    }
+
+    if (sizesRaw !== undefined) {
+        update.sizes = parseProductSizesOrNull(sizesRaw);
     }
 
     // If request is multipart and includes images, upload and replace image slots.
@@ -633,15 +822,28 @@ app.put("/products/:id", requireAdmin, maybeUploadImages, async (req, res) => {
     const fallbackUpdate = { ...update };
     delete fallbackUpdate.price_inr;
     delete fallbackUpdate.price_usd;
+    delete fallbackUpdate.mrp_inr;
+    delete fallbackUpdate.mrp_usd;
+    delete fallbackUpdate.sizes;
 
-    const { data: updated, error: updateError } = await updateWithFallback(
+    const result = await updateWithFallback(
         "products",
         update,
         { id },
         fallbackUpdate
     );
+    const { data: updated, error: updateError } = result;
 
     if (updateError) return res.status(400).json(updateError);
+
+    const requestedSizes = sizesRaw !== undefined && sizesRaw !== null && String(sizesRaw).trim() !== "";
+    if (requestedSizes && result.usedFallback) {
+        return res.json({
+            ...updated,
+            warning: "Product updated, but sizes were NOT saved (DB missing products.sizes column). Run supabase-products-sizes.sql in Supabase SQL editor.",
+        });
+    }
+
     return res.json(updated);
 });
 
@@ -802,6 +1004,18 @@ app.post("/orders", async (req, res) => {
         return res.status(400).json({ error: "Product price missing for selected currency" });
     }
 
+    // Optional: if the customer is logged in on frontend, it can send a bearer token.
+    // We use it to associate the order with that customer.
+    let customerUserId = null;
+    const customerToken = getBearerToken(req);
+    if (customerToken) {
+        const { data: userData, error: userError } = await supabasePublic.auth.getUser(customerToken);
+        if (userError || !userData?.user) {
+            return res.status(401).json({ error: "Invalid or expired customer token" });
+        }
+        customerUserId = userData.user.id;
+    }
+
     const orderRow = {
         product_id: product.id,
         product_name: product.name,
@@ -820,12 +1034,315 @@ app.post("/orders", async (req, res) => {
         currency: normalizedCurrency,
     };
 
+    if (customerUserId) {
+        orderRow.customer_user_id = customerUserId;
+    }
+
     const fallbackOrderRow = { ...orderRow };
     delete fallbackOrderRow.currency;
+    delete fallbackOrderRow.customer_user_id;
 
     const { data, error } = await insertWithFallback("orders", orderRow, fallbackOrderRow);
     if (error) return res.status(400).json(error);
-    return res.status(201).json(data);
+    return res.status(201).json({ ok: true, orderId: data?.id, order: data });
+});
+
+// 👉 CUSTOMER: order history (requires customer login)
+app.get("/customer/orders", requireCustomer, async (req, res) => {
+    if (!supabaseAdmin) {
+        return res.status(500).json({
+            error: "Server not configured for admin writes",
+            hint:
+                "Set SUPABASE_SERVICE_ROLE_KEY in backend/.env and restart backend.",
+        });
+    }
+
+    try {
+        const user = req.customer;
+        const userId = user.id;
+        const email = user.email ? String(user.email).trim().toLowerCase() : "";
+        const emailConfirmed = !!user.email_confirmed_at;
+
+        let q = supabaseAdmin
+            .from("orders")
+            .select("*")
+            .order("created_at", { ascending: false });
+
+        // Always include orders linked to user_id.
+        // Optionally include older guest orders by email, but only if email is confirmed.
+        if (email && emailConfirmed) {
+            q = q.or(`customer_user_id.eq.${userId},and(customer_user_id.is.null,email.eq.${email})`);
+        } else {
+            q = q.eq("customer_user_id", userId);
+        }
+
+        const { data, error } = await q;
+        if (error) return res.status(400).json({ error: error.message || "Failed to load orders" });
+
+        const withTracking = await attachTrackingUpdates(data || []);
+        return res.json({ ok: true, orders: withTracking || [] });
+    } catch (e) {
+        return res.status(500).json({ error: e?.message || "Failed to load orders" });
+    }
+});
+
+// 👉 ADMIN: list orders (for tracking updates panel)
+app.get("/admin/orders", requireAdmin, async (req, res) => {
+    if (!supabaseAdmin) {
+        return res.status(500).json({
+            error: "Server not configured for admin writes",
+            hint: "Set SUPABASE_SERVICE_ROLE_KEY in backend/.env and restart backend.",
+        });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 500);
+    try {
+        const { data, error } = await supabaseAdmin
+            .from("orders")
+            .select("*")
+            .order("created_at", { ascending: false })
+            .limit(limit);
+
+        if (error) return res.status(400).json({ error: error.message || "Failed to load orders" });
+        const withTracking = await attachTrackingUpdates(data || []);
+        return res.json({ ok: true, orders: withTracking || [] });
+    } catch (e) {
+        return res.status(500).json({ error: e?.message || "Failed to load orders" });
+    }
+});
+
+// 👉 ADMIN: update tracking fields on an order
+app.patch("/admin/orders/:id/tracking", requireAdmin, async (req, res) => {
+    if (!supabaseAdmin) {
+        return res.status(500).json({
+            error: "Server not configured for admin writes",
+            hint: "Set SUPABASE_SERVICE_ROLE_KEY in backend/.env and restart backend.",
+        });
+    }
+
+    const orderId = req.params.id;
+    if (!/^\d+$/.test(String(orderId))) {
+        return res.status(400).json({ error: "Invalid order id" });
+    }
+    const body = req.body || {};
+
+    const patch = {
+        estimated_delivery_at: parseDateTimeOrNull(body.estimatedDeliveryAt),
+        picked_up_from: body.pickedUpFrom !== undefined ? (String(body.pickedUpFrom || "").trim() || null) : undefined,
+        picked_up_at: parseDateTimeOrNull(body.pickedUpAt),
+        out_for_delivery: body.outForDelivery === undefined ? undefined : !!body.outForDelivery,
+        out_for_delivery_at: parseDateTimeOrNull(body.outForDeliveryAt),
+        delivered_at: parseDateTimeOrNull(body.deliveredAt),
+    };
+
+    // Remove undefined keys so we don't overwrite fields accidentally.
+    Object.keys(patch).forEach((k) => {
+        if (patch[k] === undefined) delete patch[k];
+    });
+
+    try {
+        const { data: updated, error } = await supabaseAdmin
+            .from("orders")
+            .update(patch)
+            .eq("id", orderId)
+            .select("*")
+            .maybeSingle();
+
+        if (error) {
+            if (isMissingColumnError(error)) {
+                return res.status(400).json({
+                    error: error.message,
+                    hint: "Run backend/supabase-orders-returns.sql in Supabase SQL Editor to add tracking columns.",
+                });
+            }
+            return res.status(400).json({ error: error.message || "Failed to update tracking" });
+        }
+
+        return res.json({ ok: true, order: updated || null });
+    } catch (e) {
+        return res.status(500).json({ error: e?.message || "Failed to update tracking" });
+    }
+});
+
+// 👉 ADMIN: add a "received at" location update (multiple times)
+app.post("/admin/orders/:id/tracking/received", requireAdmin, async (req, res) => {
+    if (!supabaseAdmin) {
+        return res.status(500).json({
+            error: "Server not configured for admin writes",
+            hint: "Set SUPABASE_SERVICE_ROLE_KEY in backend/.env and restart backend.",
+        });
+    }
+
+    const orderId = req.params.id;
+    if (!/^\d+$/.test(String(orderId))) {
+        return res.status(400).json({ error: "Invalid order id" });
+    }
+    const location = req.body?.location ? String(req.body.location).trim() : "";
+    const note = req.body?.note ? String(req.body.note).trim() : "";
+    const createdAt = parseDateTimeOrNull(req.body?.receivedAt);
+
+    if (!location) return res.status(400).json({ error: "location is required" });
+
+    const row = {
+        order_id: orderId,
+        location,
+        note: note || null,
+    };
+    if (createdAt) row.created_at = createdAt;
+
+    try {
+        const { data, error } = await supabaseAdmin
+            .from("order_tracking_updates")
+            .insert([row])
+            .select("id,order_id,location,note,created_at")
+            .single();
+
+        if (error) {
+            if (isMissingColumnError(error)) {
+                return res.status(400).json({
+                    error: error.message,
+                    hint: "Run backend/supabase-orders-returns.sql in Supabase SQL Editor to create order_tracking_updates table.",
+                });
+            }
+            return res.status(400).json({ error: error.message || "Failed to add tracking update" });
+        }
+
+        return res.status(201).json({ ok: true, update: data || null });
+    } catch (e) {
+        return res.status(500).json({ error: e?.message || "Failed to add tracking update" });
+    }
+});
+
+// 👉 ADMIN: update order status (so admin panel can manage orders without opening Supabase)
+app.patch("/admin/orders/:id/status", requireAdmin, async (req, res) => {
+    if (!supabaseAdmin) {
+        return res.status(500).json({
+            error: "Server not configured for admin writes",
+            hint: "Set SUPABASE_SERVICE_ROLE_KEY in backend/.env and restart backend.",
+        });
+    }
+
+    const orderId = req.params.id;
+    if (!/^\d+$/.test(String(orderId))) {
+        return res.status(400).json({ error: "Invalid order id" });
+    }
+
+    const raw = req.body?.status === undefined ? "" : String(req.body.status);
+    const status = raw.trim().toLowerCase();
+    const allowed = new Set(["pending", "confirmed", "shipped", "delivered", "cancelled"]);
+    if (!allowed.has(status)) {
+        return res.status(400).json({
+            error: "Invalid status",
+            allowed: Array.from(allowed),
+        });
+    }
+
+    try {
+        const patch = { status };
+        // Convenience: if marked delivered, set delivered_at if available.
+        if (status === "delivered") {
+            patch.delivered_at = new Date().toISOString();
+        }
+
+        const { data: updated, error } = await supabaseAdmin
+            .from("orders")
+            .update(patch)
+            .eq("id", orderId)
+            .select("*")
+            .maybeSingle();
+
+        if (error) {
+            if (isMissingColumnError(error)) {
+                // delivered_at might not exist yet; retry without it.
+                const { data: updated2, error: error2 } = await supabaseAdmin
+                    .from("orders")
+                    .update({ status })
+                    .eq("id", orderId)
+                    .select("*")
+                    .maybeSingle();
+                if (error2) return res.status(400).json({ error: error2.message || "Failed to update status" });
+                return res.json({ ok: true, order: updated2 || null });
+            }
+            return res.status(400).json({ error: error.message || "Failed to update status" });
+        }
+
+        return res.json({ ok: true, order: updated || null });
+    } catch (e) {
+        return res.status(500).json({ error: e?.message || "Failed to update status" });
+    }
+});
+
+// 👉 CUSTOMER: request return within 7 days (requires customer login)
+app.post("/customer/orders/:id/return", requireCustomer, async (req, res) => {
+    if (!supabaseAdmin) {
+        return res.status(500).json({
+            error: "Server not configured for admin writes",
+            hint:
+                "Set SUPABASE_SERVICE_ROLE_KEY in backend/.env and restart backend.",
+        });
+    }
+
+    const orderId = req.params.id;
+    const reason = (req.body && req.body.reason) ? String(req.body.reason).trim() : null;
+
+    try {
+        const user = req.customer;
+        const userId = user.id;
+        const email = user.email ? String(user.email).trim().toLowerCase() : "";
+        const emailConfirmed = !!user.email_confirmed_at;
+
+        // Load order
+        const { data: order, error: loadError } = await supabaseAdmin
+            .from("orders")
+            .select("*")
+            .eq("id", orderId)
+            .maybeSingle();
+
+        if (loadError) return res.status(400).json({ error: loadError.message || "Failed to load order" });
+        if (!order) return res.status(404).json({ error: "Order not found" });
+
+        const ownsById = order.customer_user_id && String(order.customer_user_id) === String(userId);
+        const ownsByEmail = !order.customer_user_id && emailConfirmed && email && String(order.email || "").toLowerCase() === email;
+        if (!ownsById && !ownsByEmail) return res.status(403).json({ error: "Not allowed" });
+
+        const createdAt = order.created_at ? new Date(order.created_at) : null;
+        if (!createdAt || Number.isNaN(createdAt.getTime())) {
+            return res.status(400).json({ error: "Order date missing" });
+        }
+
+        const now = new Date();
+        const daysMs = 7 * 24 * 60 * 60 * 1000;
+        if (now.getTime() - createdAt.getTime() > daysMs) {
+            return res.status(400).json({ error: "Return window expired (7 days)" });
+        }
+
+        const patch = {
+            return_status: "requested",
+            return_requested_at: new Date().toISOString(),
+            return_reason: reason,
+        };
+
+        const { data: updated, error: updateError } = await supabaseAdmin
+            .from("orders")
+            .update(patch)
+            .eq("id", orderId)
+            .select("*")
+            .maybeSingle();
+
+        if (updateError) {
+            if (isMissingColumnError(updateError)) {
+                return res.status(400).json({
+                    error: updateError.message,
+                    hint: "Run backend/supabase-orders-returns.sql in Supabase SQL Editor to add return columns.",
+                });
+            }
+            return res.status(400).json({ error: updateError.message || "Failed to request return" });
+        }
+
+        return res.json({ ok: true, order: updated || null });
+    } catch (e) {
+        return res.status(500).json({ error: e?.message || "Failed to request return" });
+    }
 });
 
 // -------------------- PAYPAL (USA PAYMENTS) --------------------
@@ -1011,6 +1528,17 @@ app.post("/paypal/capture-order", async (req, res) => {
     const computed = await computeUsdTotalFromItems(items);
     if (!computed.ok) return res.status(400).json({ error: computed.error });
 
+    // Optional: customer association (same as COD endpoint)
+    let customerUserId = null;
+    const customerToken = getBearerToken(req);
+    if (customerToken) {
+        const { data: userData, error: userError } = await supabasePublic.auth.getUser(customerToken);
+        if (userError || !userData?.user) {
+            return res.status(401).json({ error: "Invalid or expired customer token" });
+        }
+        customerUserId = userData.user.id;
+    }
+
     try {
         const accessToken = await getPayPalAccessToken();
         const baseUrl = getPayPalBaseUrl();
@@ -1083,8 +1611,13 @@ app.post("/paypal/capture-order", async (req, res) => {
                     currency: "USD",
                 };
 
+                if (customerUserId) {
+                    orderRow.customer_user_id = customerUserId;
+                }
+
                 const fallbackOrderRow = { ...orderRow };
                 delete fallbackOrderRow.currency;
+                delete fallbackOrderRow.customer_user_id;
 
                 // eslint-disable-next-line no-await-in-loop
                 const { data, error } = await insertWithFallback("orders", orderRow, fallbackOrderRow);
